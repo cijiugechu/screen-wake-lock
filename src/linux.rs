@@ -1,7 +1,7 @@
-use crate::{WakeLockError, WakeLockResult};
+use crate::{Error, LinuxOptions};
 use std::collections::BTreeMap;
 use zbus::blocking::{Connection, Proxy};
-use zbus::zvariant::{OwnedFd, OwnedObjectPath, OwnedValue};
+use zbus::zvariant::{OwnedFd, OwnedObjectPath, OwnedValue, Str};
 
 const GNOME_INHIBIT_IDLE: u32 = 8;
 const PORTAL_INHIBIT_IDLE: u32 = 8;
@@ -27,8 +27,8 @@ enum Backend {
 
     // System bus (fd must remain open)
     Logind {
-        conn: Connection,
-        fd: OwnedFd,
+        _conn: Connection,
+        _fd: OwnedFd,
     },
 }
 
@@ -37,20 +37,20 @@ pub struct PlatformWakeLock {
 }
 
 impl PlatformWakeLock {
-    pub fn acquire(reason: &str) -> WakeLockResult<Self> {
+    pub fn acquire(application_id: &str, reason: &str) -> Result<Self, Error> {
         // Prefer session-bus mechanisms when available.
         if let Ok(conn) = Connection::session() {
-            if let Ok(cookie) = try_gnome_session(&conn, reason) {
+            if let Ok(cookie) = try_gnome_session(&conn, application_id, reason) {
                 return Ok(Self {
                     backend: Backend::GnomeSession { conn, cookie },
                 });
             }
-            if let Ok(cookie) = try_fdo_screensaver(&conn, reason) {
+            if let Ok(cookie) = try_fdo_screensaver(&conn, application_id, reason) {
                 return Ok(Self {
                     backend: Backend::FdoScreenSaver { conn, cookie },
                 });
             }
-            if let Ok(cookie) = try_fdo_powermanagement(&conn, reason) {
+            if let Ok(cookie) = try_fdo_powermanagement(&conn, application_id, reason) {
                 return Ok(Self {
                     backend: Backend::FdoPowerManagement { conn, cookie },
                 });
@@ -63,18 +63,21 @@ impl PlatformWakeLock {
         }
 
         // Fallback: systemd-logind idle inhibitor (system bus).
-        if let Ok((conn, fd)) = try_logind(reason) {
+        if let Ok((conn, fd)) = try_logind(application_id, reason) {
             return Ok(Self {
-                backend: Backend::Logind { conn, fd },
+                backend: Backend::Logind {
+                    _conn: conn,
+                    _fd: fd,
+                },
             });
         }
 
-        Err(WakeLockError::Platform(
+        Err(Error::Unsupported(
             "no suitable Linux inhibition backend found".to_string(),
         ))
     }
 
-    pub fn release(self) -> WakeLockResult<()> {
+    pub fn release(self) -> Result<(), Error> {
         match self.backend {
             Backend::GnomeSession { conn, cookie } => {
                 let proxy = Proxy::new(
@@ -82,8 +85,9 @@ impl PlatformWakeLock {
                     "org.gnome.SessionManager",
                     "/org/gnome/SessionManager",
                     "org.gnome.SessionManager",
-                )?;
-                let _ = proxy.call::<(), _>("Uninhibit", &(cookie));
+                )
+                .map_err(|e| Error::Dbus(e.to_string()))?;
+                let _: zbus::Result<()> = proxy.call("Uninhibit", &(cookie));
                 Ok(())
             }
             Backend::FdoScreenSaver { conn, cookie } => {
@@ -92,8 +96,9 @@ impl PlatformWakeLock {
                     "org.freedesktop.ScreenSaver",
                     "/org/freedesktop/ScreenSaver",
                     "org.freedesktop.ScreenSaver",
-                )?;
-                let _ = proxy.call::<(), _>("UnInhibit", &(cookie));
+                )
+                .map_err(|e| Error::Dbus(e.to_string()))?;
+                let _: zbus::Result<()> = proxy.call("UnInhibit", &(cookie));
                 Ok(())
             }
             Backend::FdoPowerManagement { conn, cookie } => {
@@ -102,8 +107,9 @@ impl PlatformWakeLock {
                     "org.freedesktop.PowerManagement",
                     "/org/freedesktop/PowerManagement/Inhibit",
                     "org.freedesktop.PowerManagement.Inhibit",
-                )?;
-                let _ = proxy.call::<(), _>("UnInhibit", &(cookie));
+                )
+                .map_err(|e| Error::Dbus(e.to_string()))?;
+                let _: zbus::Result<()> = proxy.call("UnInhibit", &(cookie));
                 Ok(())
             }
             Backend::XdgPortal { conn, handle } => {
@@ -113,11 +119,12 @@ impl PlatformWakeLock {
                     "org.freedesktop.portal.Desktop",
                     handle,
                     "org.freedesktop.portal.Request",
-                )?;
-                let _ = proxy.call::<(), _>("Close", &());
+                )
+                .map_err(|e| Error::Dbus(e.to_string()))?;
+                let _: zbus::Result<()> = proxy.call("Close", &());
                 Ok(())
             }
-            Backend::Logind { conn: _, fd: _ } => {
+            Backend::Logind { .. } => {
                 // The inhibitor is released when the FD is closed (dropped).
                 Ok(())
             }
@@ -125,40 +132,81 @@ impl PlatformWakeLock {
     }
 }
 
-fn try_gnome_session(conn: &Connection, reason: &str) -> WakeLockResult<u32> {
+pub struct Inner {
+    lock: Option<PlatformWakeLock>,
+    active: bool,
+}
+
+pub fn is_supported() -> bool {
+    Connection::session().is_ok() || Connection::system().is_ok()
+}
+
+pub fn acquire(reason: &str, linux: LinuxOptions) -> Result<Inner, Error> {
+    let application_id = linux
+        .application_id
+        .as_deref()
+        .unwrap_or("screen_wake_lock");
+    let effective_reason = linux.reason.as_deref().unwrap_or(reason);
+
+    let lock = PlatformWakeLock::acquire(application_id, effective_reason)?;
+    Ok(Inner {
+        lock: Some(lock),
+        active: true,
+    })
+}
+
+pub fn release(inner: &mut Inner) {
+    if !inner.active {
+        return;
+    }
+    // Best-effort: ignore D-Bus errors during release.
+    if let Some(lock) = inner.lock.take() {
+        let _ = lock.release();
+    }
+    inner.active = false;
+}
+
+fn try_gnome_session(conn: &Connection, application_id: &str, reason: &str) -> zbus::Result<u32> {
     let proxy = Proxy::new(
         conn,
         "org.gnome.SessionManager",
         "/org/gnome/SessionManager",
         "org.gnome.SessionManager",
     )?;
-    let cookie: u32 = proxy.call("Inhibit", &("wake_lock", 0u32, reason, GNOME_INHIBIT_IDLE))?;
+    let cookie: u32 = proxy.call(
+        "Inhibit",
+        &(application_id, 0u32, reason, GNOME_INHIBIT_IDLE),
+    )?;
     Ok(cookie)
 }
 
-fn try_fdo_screensaver(conn: &Connection, reason: &str) -> WakeLockResult<u32> {
+fn try_fdo_screensaver(conn: &Connection, application_id: &str, reason: &str) -> zbus::Result<u32> {
     let proxy = Proxy::new(
         conn,
         "org.freedesktop.ScreenSaver",
         "/org/freedesktop/ScreenSaver",
         "org.freedesktop.ScreenSaver",
     )?;
-    let cookie: u32 = proxy.call("Inhibit", &("wake_lock", reason))?;
+    let cookie: u32 = proxy.call("Inhibit", &(application_id, reason))?;
     Ok(cookie)
 }
 
-fn try_fdo_powermanagement(conn: &Connection, reason: &str) -> WakeLockResult<u32> {
+fn try_fdo_powermanagement(
+    conn: &Connection,
+    application_id: &str,
+    reason: &str,
+) -> zbus::Result<u32> {
     let proxy = Proxy::new(
         conn,
         "org.freedesktop.PowerManagement",
         "/org/freedesktop/PowerManagement/Inhibit",
         "org.freedesktop.PowerManagement.Inhibit",
     )?;
-    let cookie: u32 = proxy.call("Inhibit", &("wake_lock", reason))?;
+    let cookie: u32 = proxy.call("Inhibit", &(application_id, reason))?;
     Ok(cookie)
 }
 
-fn try_xdg_portal(conn: &Connection, reason: &str) -> WakeLockResult<OwnedObjectPath> {
+fn try_xdg_portal(conn: &Connection, reason: &str) -> zbus::Result<OwnedObjectPath> {
     let proxy = Proxy::new(
         conn,
         "org.freedesktop.portal.Desktop",
@@ -167,14 +215,14 @@ fn try_xdg_portal(conn: &Connection, reason: &str) -> WakeLockResult<OwnedObject
     )?;
 
     let mut options: BTreeMap<String, OwnedValue> = BTreeMap::new();
-    options.insert("reason".to_string(), OwnedValue::from(reason.to_string()));
+    options.insert("reason".to_string(), OwnedValue::from(Str::from(reason)));
 
     // flags: 8 = Idle
     let handle: OwnedObjectPath = proxy.call("Inhibit", &("", PORTAL_INHIBIT_IDLE, options))?;
     Ok(handle)
 }
 
-fn try_logind(reason: &str) -> WakeLockResult<(Connection, OwnedFd)> {
+fn try_logind(application_id: &str, reason: &str) -> zbus::Result<(Connection, OwnedFd)> {
     let conn = Connection::system()?;
     let proxy = Proxy::new(
         &conn,
@@ -184,6 +232,6 @@ fn try_logind(reason: &str) -> WakeLockResult<(Connection, OwnedFd)> {
     )?;
 
     // what: "idle" (inhibit idle actions), mode: "block".
-    let fd: OwnedFd = proxy.call("Inhibit", &("idle", "wake_lock", reason, "block"))?;
+    let fd: OwnedFd = proxy.call("Inhibit", &("idle", application_id, reason, "block"))?;
     Ok((conn, fd))
 }
